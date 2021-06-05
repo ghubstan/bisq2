@@ -1,0 +1,120 @@
+import java.nio.file.Files
+
+// Locally scoped defs
+def jdk16Binaries = [
+        // Download URLs (and associated binary hashes) for the JDK used to package the installers.
+        // These JDKs are independent of what is installed on the building system.
+        //
+        // If these specific versions are not hosted by AdoptOpenJDK anymore, or if different versions are desired,
+        // simply update the links and associated hashes below.
+        //
+        // See https://adoptopenjdk.net/releases.html?variant=openjdk16&jvmVariant=hotspot for latest download URLs
+        // On the download page linked above, filter as follows to get the binary URL + associated SHA256:
+        // - architecture: x64
+        // - operating system:
+        // -- linux   ( -> use the tar.gz JDK link)
+        // -- macOS   ( -> use the tar.gz JDK link)
+        // -- windows ( -> use the .zip JDK link)
+        // https://github.com/AdoptOpenJDK/openjdk16-binaries
+        // https://github.com/AdoptOpenJDK/openjdk16-binaries/releases/tag/jdk-16.0.1%2B9
+        'linux'         : 'https://github.com/AdoptOpenJDK/openjdk16-binaries/releases/download/jdk-16.0.1%2B9/OpenJDK16U-jdk_x64_linux_hotspot_16.0.1_9.tar.gz',
+        'linux-sha256'  : '7fdda042207efcedd30cd76d6295ed56b9c2e248cb3682c50898a560d4aa1c6f',
+        'mac'           : 'https://github.com/AdoptOpenJDK/openjdk16-binaries/releases/download/jdk-16.0.1%2B9/OpenJDK16U-jdk_x64_mac_hotspot_16.0.1_9.tar.gz',
+        'mac-sha256'    : '3be78eb2b0bf0a6edeextractedJdkHomea8f543958d6e249a70c71e4d7347f9edb831135a16b8',
+        'aarch64'       : 'https://github.com/AdoptOpenJDK/openjdk16-binaries/releases/download/jdk-16.0.1%2B9/OpenJDK16U-jdk_aarch64_linux_hotspot_16.0.1_9.tar.gz',
+        'aarch64-sha256': '3447ec27a6dbd4f3a6180a0d4371bb09aa428c16eea9983e515a7400cc9f5c85',
+        'windows'       : 'https://github.com/AdoptOpenJDK/openjdk16-binaries/releases/download/jdk-16.0.1%2B9/OpenJDK16U-jdk_x64_windows_hotspot_16.0.1_9.zip',
+        'windows-sha256': '0a91e179c4d34b5d905fd2945a21927a6acb798b4e8extractedJdkHomed528ece32c025bbcaff'
+]
+def useLocalRuntime = hasProperty('useJavaHomeRuntimeImage')
+def bundledRuntime = useLocalRuntime ? System.getProperty('java.home') : jdk16Binaries[osFamily]
+def downloadUrlSpec = useLocalRuntime ? 'none' : jdk16Binaries[osFamily]
+def archiveChecksum = useLocalRuntime ? 'none' : jdk16Binaries[osFamily + '-sha256']
+def tempRootDirName = 'temp-runtime-' + new Date().format('yyyy.MM.dd-HHmmssSSS')
+//noinspection GroovyAssignabilityCheck
+def tempRootDir = new File(project.buildDir, tempRootDirName)
+def jdkForJpackageDir = new File(tempRootDir, 'jdk-jpackage')
+def jdkForJpackageArchiveFileName = downloadUrlSpec.tokenize('/').last()
+//noinspection GroovyAssignabilityCheck
+def jdkForJpackageFile = new File(jdkForJpackageDir, jdkForJpackageArchiveFileName)
+
+tasks.register('prepareJdkForJpackage') {
+    if(useLocalRuntime) {
+        dependsOn('copyJavaHome')
+    } else {
+        dependsOn('copyDownloadedRuntime')
+    }
+}
+
+tasks.register('copyJavaHome', Copy) {
+    from(System.getProperty('java.home'))
+    into("$buildDir/jdk")
+}
+
+tasks.register('createTmpDirs') {
+    doLast {
+        println "Task:  createTmpDirs"
+        tempRootDir.mkdirs()
+        jdkForJpackageDir.mkdirs()
+    }
+}
+
+tasks.register('downloadOpenJDKArchive') {
+    dependsOn('createTmpDirs')
+    doLast {
+        println "Task:  downloadOpenJDKArchive $bundledRuntime"
+        def url = new URL(downloadUrlSpec)
+        url.withInputStream { i -> jdkForJpackageFile.withOutputStream { it << i } }
+    }
+}
+
+tasks.register('verifyChecksum') {
+    dependsOn('downloadOpenJDKArchive')
+    doLast {
+        println "Task:  verifyChecksum for ${jdkForJpackageFile.getName()}"
+        ant.jdkHash = archiveChecksum
+        ant.checksum(file: jdkForJpackageFile, algorithm: 'SHA-256', property: '${jdkHash}', verifyProperty: 'hashMatches')
+        if (ant.properties['hashMatches'] != 'true') {
+            ant.fail('Checksum mismatch:  downloaded JDK binary has invalid checksum.')
+        }
+    }
+}
+
+tasks.register('extractRuntimeArchive') {
+    dependsOn('downloadOpenJDKArchive', 'verifyChecksum')
+    doLast {
+        println "Task:  extractRuntimeArchive ${jdkForJpackageFile.getName()} into ${jdkForJpackageDir.getName()}"
+        if (osFamily.equals('windows')) {
+            ant.unzip(src: jdkForJpackageFile, dest: jdkForJpackageDir)
+        } else {
+            copy {
+                // Gradle tar extraction preserves permissions as required by jpackage.
+                from tarTree(resources.gzip(jdkForJpackageFile))
+                into jdkForJpackageDir
+            }
+        }
+    }
+}
+
+tasks.register('copyDownloadedRuntime') {
+    dependsOn('extractRuntimeArchive')
+    doLast {
+        println "Task:  copyDownloadedRuntime from ${jdkForJpackageFile.getName()}"
+        def walker = Files.walk(jdkForJpackageDir.toPath(), 1)
+        def extractedRuntime = walker
+                .filter(file -> Files.isDirectory(file))
+                .filter(file -> file.toFile().getName().startsWith("jdk"))
+                .filter(file -> file.toFile() != jdkForJpackageDir)
+                .map(java.nio.file.Path::toFile)
+                .findFirst()
+        if (extractedRuntime.isEmpty()) {
+            throw new GradleException("Could not find extracted jdk runtime in ${jdkForJpackageFile}.")
+        } else {
+            def genericJdkRuntimeDir = "${jdkForJpackageDir}/jdk"
+            println "Renaming extracted ${extractedRuntime.get()} folder as 'jdk'"
+            ant.move file: "${extractedRuntime.get()}", tofile: "${genericJdkRuntimeDir}"
+            println "Moving ${genericJdkRuntimeDir} to\n\t ${buildDir}/jdk (jackage's expected --runtime-image location)"
+            ant.move file: "${genericJdkRuntimeDir}", todir: "${buildDir}"
+        }
+    }
+}

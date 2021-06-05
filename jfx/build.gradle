@@ -3,10 +3,12 @@ plugins {
     id 'application'
     id 'distribution'
     id 'org.openjfx.javafxplugin' version '0.0.10'
+    id 'org.panteleyev.jpackageplugin' version '1.3.1'
 }
 
 repositories {
     mavenCentral()
+    maven { url 'https://jitpack.io' }
 }
 
 apply from: '../buildSrc/misq-version.gradle'
@@ -38,6 +40,54 @@ apply from: '../buildSrc/logging-dependencies.gradle'
 apply from: '../buildSrc/test-dependencies.gradle'
 
 dependencies {
+}
+
+apply from: '../package/get-runtime.gradle'
+
+tasks.register('copyAppDepsForJpackage', Copy) {
+    from(configurations.runtimeClasspath).into("$buildDir/jars")
+}
+
+tasks.register('copyAppJarForJpackage', Copy) {
+    from(tasks.jar).into("$buildDir/jars")
+}
+
+tasks.register('validateJfx16NativeLibArg') {
+    doLast {
+        // Jpackage task fails without ./gradlew argument -Pjfx16NativeLib=<path-to-javafx-sdk-16>/lib.
+        def libDirExists = new File(jfx16NativeLib).exists()
+        println "Gradle param -Pjfx16NativeLib=${jfx16NativeLib} is valid path: ${libDirExists}"
+    }
+}
+
+tasks.register('copyJfxNativeLibsForJpackage', Copy) {
+    from(jfx16NativeLib).into("$buildDir/native-jfx")
+}
+
+tasks.jpackage {
+    dependsOn('build',
+            'validateJfx16NativeLibArg',
+            'prepareJdkForJpackage',
+            'copyAppDepsForJpackage',
+            'copyAppJarForJpackage',
+            'copyJfxNativeLibsForJpackage')
+
+    appName = 'Misq'
+    appVersion = project.version.toString()
+    vendor = group
+    copyright = 'Copyright (c) 2021 Misq'
+    // TODO licenseFile = "${rootProject.?}/LICENSE"
+    runtimeImage = "${buildDir}/jdk"
+    input = "$buildDir/jars"
+    destination = "$buildDir/native-pkg"
+    mainJar = tasks.jar.archiveFileName.get()
+    mainClass = "network.misq.jfx.Main"
+    modulePaths = ["$buildDir/native-jfx"]
+    javaOptions = ['-Dfile.encoding=UTF-8', '--add-modules=javafx.controls,javafx.graphics']
+    linux {
+        icon = '../package/icon/icon.png'
+        linuxPackageName = 'misq'
+    }
 }
 
 test {
